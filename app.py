@@ -350,7 +350,7 @@ def ejecutar_optimizacion():
         if not ciudad_seleccionada:
             ciudad_seleccionada = "General"
         
-        html_filename = f'Mapa Propuesta {ciudad_seleccionada}.html'
+        html_filename = f'Mapa Propuesta {ciudad_seleccionada}, {escenario}.html'
         m.save(html_filename)
 
         file_metadata = {
@@ -379,7 +379,7 @@ def ejecutar_optimizacion():
         except Exception as perm_e:
             print(f"Advertencia al dar permisos de dominio: {perm_e}")
 
-        formula_link = f'=HYPERLINK("{direct_download_url}", "🗺️ Abrir Mapa {ciudad_seleccionada}")'
+        formula_link = f'=HYPERLINK("{direct_download_url}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
         sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')
 
         # =========================================================
