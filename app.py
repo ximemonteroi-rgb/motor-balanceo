@@ -417,3 +417,13 @@ def ejecutar_optimizacion():
             print(f"Error actualizando la hoja portfolio: {port_e}")
 
         return jsonify({"mensaje": "Balanceo exitoso y Sheets actualizado"}), 200
+        
+    except Exception as e:
+        import traceback
+        error_detallado = traceback.format_exc()
+        print("ERROR FATAL:\n", error_detallado)
+        return jsonify({"error": error_detallado}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
