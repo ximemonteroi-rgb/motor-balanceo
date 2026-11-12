@@ -282,7 +282,7 @@ def ejecutar_optimizacion():
             return pd.DataFrame(sol)
 
         # =========================================================
-        # 7. EJECUCIÓN Y EXPORTACIÓN A GOOGLE SHEETS
+        # 7. EJECUCIÓN Y EXPORTACIÓN A GOOGLE SHEETS (SUMMARY)
         # =========================================================
         df_p1 = solve_scenario(1.0, 0.0, "Propuesta 1")
         df_p2 = solve_scenario(0.5, 0.5, "Propuesta 2")
@@ -293,7 +293,11 @@ def ejecutar_optimizacion():
         df_export = df_export.merge(df_p2, on='BD Area ID', how='left') if df_p2 is not None else df_export.assign(**{'Propuesta 2': "Inviable"})
         df_export = df_export.merge(df_p3, on='BD Area ID', how='left') if df_p3 is not None else df_export.assign(**{'Propuesta 3': "Inviable"})
 
-        # Limpiar y actualizar Sheets
+        # Asegúrate de reincorporar las columnas de propuestas al df principal para que el mapa las lea
+        df['Propuesta 1'] = df_export['Propuesta 1']
+        df['Propuesta 2'] = df_export['Propuesta 2']
+        df['Propuesta 3'] = df_export['Propuesta 3']
+
         fila_inicio_datos = fila_encabezados + 2
         rango_limpiar = f'J{fila_inicio_datos}:L'
         sheet_summary.batch_clear([rango_limpiar])
@@ -301,13 +305,115 @@ def ejecutar_optimizacion():
         datos_exportar = df_export[['Propuesta 1', 'Propuesta 2', 'Propuesta 3']].fillna("Sin Asignar").values.tolist()
         sheet_summary.update(f'J{fila_inicio_datos}', datos_exportar)
 
+        # =========================================================
+        # 8. GENERAR MAPA Y SUBIR A DRIVE
+        # =========================================================
+        import folium
+        from googleapiclient.http import MediaFileUpload
+        import matplotlib.colors as mcolors
+
+        # Integrar las geometrías con las propuestas resueltas
+        gdf_final = gdf_kml.merge(df, left_on='KML_ID', right_on='Sheets_ID', how='inner')
+        if len(gdf_final) == 0:
+            gdf_final = gdf_kml.merge(df, left_on='KML_Name_Num', right_on='Sheets_Name_Num', how='inner')
+
+        # Centro del mapa
+        center_lat = gdf_final.geometry.centroid.y.mean()
+        center_lon = gdf_final.geometry.centroid.x.mean()
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+
+        # Configurar colores
+        bds_todos = list(set(bds_elegibles + df['BD Actual'].dropna().unique().tolist()))
+        colores_base = list(mcolors.TABLEAU_COLORS.values())
+        color_dict = {bd: colores_base[i % len(colores_base)] for i, bd in enumerate(bds_todos)}
+
+        def get_style(bd_name):
+            color = color_dict.get(bd_name, '#000000')
+            return {'fillColor': color, 'color': 'white', 'weight': 1.5, 'fillOpacity': 0.7}
+
+        base_tooltip = "<b>Área:</b> {bd_area_id}<br><b>Shops:</b> {shops}<br>"
+
+        # Capas de las propuestas
+        fg_p1 = folium.FeatureGroup(name='Propuesta 1', show=True)
+        for _, row in gdf_final.iterrows():
+            bd_p1 = row.get('Propuesta 1', 'Sin Asignar')
+            tooltip_text = base_tooltip.format(bd_area_id=row['BD Area ID'], shops=row.get('Rs 1', 0)) + f"<b>Propuesta 1:</b> {bd_p1}"
+            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_p1: get_style(bd), tooltip=tooltip_text).add_to(fg_p1)
+        fg_p1.add_to(m)
+
+        # (Puedes agregar las capas fg_p2 y fg_p3 siguiendo el mismo patrón si lo deseas)
+
+        folium.LayerControl().add_to(m)
+
+        # Guardar y subir a Drive
+        ciudad_seleccionada = sheet_summary.acell('C5').value
+        if not ciudad_seleccionada:
+            ciudad_seleccionada = "General"
+        
+        html_filename = f'Mapa Propuesta {ciudad_seleccionada}.html'
+        m.save(html_filename)
+
+        file_metadata = {
+            'name': html_filename,
+            'parents': ['1ihMz5xyxcFrun4tEUvXaBES2RFRMwp0i']  # El ID de tu carpeta
+        }
+        
+        media = MediaFileUpload(html_filename, mimetype='text/html', resumable=True)
+        uploaded_file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True
+        ).execute()
+
+        file_id = uploaded_file.get('id')
+        direct_download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
+
+        # Permisos (Ajustados al bloque try/except por si el usuario del token no tiene permisos de administrador en Drive)
+        try:
+            drive_service.permissions().create(
+                fileId=file_id,
+                body={'type': 'domain', 'role': 'reader', 'domain': 'didi-labs.com'},
+                supportsAllDrives=True
+            ).execute()
+        except Exception as perm_e:
+            print(f"Advertencia al dar permisos de dominio: {perm_e}")
+
+        formula_link = f'=HYPERLINK("{direct_download_url}", "🗺️ Abrir Mapa {ciudad_seleccionada}")'
+        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')
+
+        # =========================================================
+        # 9. ACTUALIZAR HOJA "portfolio"
+        # =========================================================
+        try:
+            sheet_portfolio = spreadsheet.worksheet('portfolio')
+            portfolio_raw = sheet_portfolio.get_all_values()
+            encabezados_port = portfolio_raw[0]
+
+            df_port = pd.DataFrame(portfolio_raw[1:], columns=encabezados_port)
+
+            map_p1 = {re.sub(r'[^0-9]', '', str(k)): v for k, v in zip(df['BD Area ID'], df['Propuesta 1'])}
+            map_p2 = {re.sub(r'[^0-9]', '', str(k)): v for k, v in zip(df['BD Area ID'], df['Propuesta 2'])}
+            map_p3 = {re.sub(r'[^0-9]', '', str(k)): v for k, v in zip(df['BD Area ID'], df['Propuesta 3'])}
+
+            for idx, row in df_port.iterrows():
+                area_id_raw = str(row.get('ID de BD Area', '')).strip()
+                area_num = re.sub(r'[^0-9]', '', area_id_raw)
+                if area_num in map_p1 and area_num != "":
+                    df_port.at[idx, 'Propuesta 1'] = map_p1[area_num]
+                    df_port.at[idx, 'Propuesta 2'] = map_p2[area_num]
+                    df_port.at[idx, 'Propuesta 3'] = map_p3[area_num]
+
+            col_inicio_idx = encabezados_port.index('Propuesta 1') + 1
+            columnas_subir_port = ['Propuesta 1', 'Propuesta 2', 'Propuesta 3']
+            datos_subir_port = df_port[columnas_subir_port].values.tolist()
+
+            from gspread.utils import rowcol_to_a1
+            rango_inicio_port = rowcol_to_a1(2, col_inicio_idx)
+            rango_fin_port = rowcol_to_a1(1 + len(datos_subir_port), col_inicio_idx + 2)
+            
+            sheet_portfolio.update(values=datos_subir_port, range_name=f'{rango_inicio_port}:{rango_fin_port}')
+        except Exception as port_e:
+            print(f"Error actualizando la hoja portfolio: {port_e}")
+
         return jsonify({"mensaje": "Balanceo exitoso y Sheets actualizado"}), 200
-
-    except Exception as e:
-        error_detallado = traceback.format_exc()
-        print("ERROR FATAL:\n", error_detallado)
-        return jsonify({"error": error_detallado}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
