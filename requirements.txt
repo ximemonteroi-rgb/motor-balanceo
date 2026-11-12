@@ -1,0 +1,12 @@
+flask
+flask-cors
+gunicorn
+pulp==2.7.0
+pandas
+geopandas
+networkx
+shapely
+gspread
+google-auth
+google-api-python-client
+pykml
