@@ -5,6 +5,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import pandas as pd
 import geopandas as gpd
+import traceback
 import io
 import re
 from shapely.geometry import Polygon
@@ -303,8 +304,9 @@ def ejecutar_optimizacion():
         return jsonify({"mensaje": "Balanceo exitoso y Sheets actualizado"}), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        error_detallado = traceback.format_exc()
+        print("ERROR FATAL:\n", error_detallado)
+        return jsonify({"error": error_detallado}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
