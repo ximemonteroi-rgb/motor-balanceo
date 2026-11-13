@@ -304,7 +304,7 @@ def ejecutar_optimizacion():
         
         datos_exportar = df_export[['Propuesta 1', 'Propuesta 2', 'Propuesta 3']].fillna("Sin Asignar").values.tolist()
         sheet_summary.update(f'J{fila_inicio_datos}', datos_exportar)
-
+        
         # =========================================================
         # 8. GENERAR MAPA Y SUBIR A DRIVE
         # =========================================================
@@ -312,38 +312,75 @@ def ejecutar_optimizacion():
         from googleapiclient.http import MediaFileUpload
         import matplotlib.colors as mcolors
 
-        # Integrar las geometrías con las propuestas resueltas
+        # Sistema automático de cruce para el mapa (Fallback)
         gdf_final = gdf_kml.merge(df, left_on='KML_ID', right_on='Sheets_ID', how='inner')
         if len(gdf_final) == 0:
             gdf_final = gdf_kml.merge(df, left_on='KML_Name_Num', right_on='Sheets_Name_Num', how='inner')
 
-        # Centro del mapa
-        center_lat = gdf_final.geometry.centroid.y.mean()
-        center_lon = gdf_final.geometry.centroid.x.mean()
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
-
-        # Configurar colores
         bds_todos = list(set(bds_elegibles + df['BD Actual'].dropna().unique().tolist()))
+        bds_todos = [bd for bd in bds_todos if bd != 'Sin Asignar']
+
         colores_base = list(mcolors.TABLEAU_COLORS.values())
         color_dict = {bd: colores_base[i % len(colores_base)] for i, bd in enumerate(bds_todos)}
+        color_dict['Sin Asignar'] = '#000000'
+
+        # Calcular centro limpiamente
+        centro_y = gdf_final.geometry.centroid.y.mean() if not gdf_final.empty else 0
+        centro_x = gdf_final.geometry.centroid.x.mean() if not gdf_final.empty else 0
+
+        # Usar un enlace de mapa directo para evadir baneos de OSM y marcas de agua de CartoDB
+        tiles_url = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+        attr = '&copy; OpenStreetMap contributors &copy; CARTO'
+        m = folium.Map(location=[centro_y, centro_x], zoom_start=12, tiles=tiles_url, attr=attr)
+
+        fg_actual = folium.FeatureGroup(name='Estado Actual', show=False)
+        fg_p1 = folium.FeatureGroup(name='Propuesta 1', show=True)
+        fg_p2 = folium.FeatureGroup(name='Propuesta 2', show=False)
+        fg_p3 = folium.FeatureGroup(name='Propuesta 3', show=False)
 
         def get_style(bd_name):
-            color = color_dict.get(bd_name, '#000000')
-            return {'fillColor': color, 'color': 'white', 'weight': 1.5, 'fillOpacity': 0.7}
+            return {
+                'fillColor': color_dict.get(bd_name, '#000000'),
+                'color': 'white',
+                'weight': 1.5,
+                'fillOpacity': 0.7
+            }
 
-        base_tooltip = "<b>Área:</b> {bd_area_id}<br><b>Shops:</b> {shops}<br>"
+        for idx, row in gdf_final.iterrows():
+            base_tooltip = f"<b>Área:</b> {row['BD Area ID']}<br><b>Shops:</b> {row['Rs 1']}<br>"
 
-        # Capas de las propuestas
-        fg_p1 = folium.FeatureGroup(name='Propuesta 1', show=True)
-        for _, row in gdf_final.iterrows():
+            bd_actual = row.get('BD Actual', 'Sin Asignar')
+            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_actual: get_style(bd), tooltip=base_tooltip + f"<b>BD Asignado:</b> {bd_actual}").add_to(fg_actual)
+
             bd_p1 = row.get('Propuesta 1', 'Sin Asignar')
-            tooltip_text = base_tooltip.format(bd_area_id=row['BD Area ID'], shops=row.get('Rs 1', 0)) + f"<b>Propuesta 1:</b> {bd_p1}"
-            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_p1: get_style(bd), tooltip=tooltip_text).add_to(fg_p1)
+            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_p1: get_style(bd), tooltip=base_tooltip + f"<b>Propuesta 1:</b> {bd_p1}").add_to(fg_p1)
+
+            bd_p2 = row.get('Propuesta 2', 'Sin Asignar')
+            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_p2: get_style(bd), tooltip=base_tooltip + f"<b>Propuesta 2:</b> {bd_p2}").add_to(fg_p2)
+
+            bd_p3 = row.get('Propuesta 3', 'Sin Asignar')
+            folium.GeoJson(row['geometry'], style_function=lambda x, bd=bd_p3: get_style(bd), tooltip=base_tooltip + f"<b>Propuesta 3:</b> {bd_p3}").add_to(fg_p3)
+
+        fg_actual.add_to(m)
         fg_p1.add_to(m)
-
-        # (Puedes agregar las capas fg_p2 y fg_p3 siguiendo el mismo patrón si lo deseas)
-
+        fg_p2.add_to(m)
+        fg_p3.add_to(m)
         folium.LayerControl().add_to(m)
+
+        # LEYENDA
+        legend_html = '''
+        <div style="position: fixed;
+                    top: 150px; right: 10px; width: auto; max-height: 400px; overflow-y: auto;
+                    border:2px solid grey; z-index:9999; font-size:14px;
+                    background-color:white; padding: 10px;">
+            <b>Owner Legend</b><br>
+        '''
+        for bd in bds_todos:
+            color = color_dict.get(bd, '#000000')
+            legend_html += f'<div style="margin-bottom:3px;"><i style="background:{color};width:15px;height:15px;float:left;margin-right:5px;border:1px solid black;"></i>{bd}</div>'
+        legend_html += '</div>'
+
+        m.get_root().html.add_child(folium.Element(legend_html))
 
         # Guardar y subir a Drive
         ciudad_seleccionada = sheet_summary.acell('C5').value
@@ -355,7 +392,7 @@ def ejecutar_optimizacion():
 
         file_metadata = {
             'name': html_filename,
-            'parents': ['1iHmZ5xyxcFrun4tEUvXaBES2RFRMwp0i']  # El ID de tu carpeta
+            'parents': ['1iHmZ5xyxcFrun4tEUvXaBES2RFRMwp0i']  
         }
         
         media = MediaFileUpload(html_filename, mimetype='text/html', resumable=True)
@@ -369,7 +406,6 @@ def ejecutar_optimizacion():
         file_id = uploaded_file.get('id')
         direct_download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
 
-        # Permisos (Ajustados al bloque try/except por si el usuario del token no tiene permisos de administrador en Drive)
         try:
             drive_service.permissions().create(
                 fileId=file_id,
@@ -380,9 +416,7 @@ def ejecutar_optimizacion():
             print(f"Advertencia al dar permisos de dominio: {perm_e}")
 
         formula_link = f'=HYPERLINK("{direct_download_url}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
-        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')
-
-        # =========================================================
+        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')        # =========================================================
         # 9. ACTUALIZAR HOJA "portfolio"
         # =========================================================
         try:
