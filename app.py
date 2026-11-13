@@ -355,7 +355,7 @@ def ejecutar_optimizacion():
 
         file_metadata = {
             'name': html_filename,
-            'parents': ['1ihMz5xyxcFrun4tEUvXaBES2RFRMwp0i']  # El ID de tu carpeta
+            'parents': ['1iHmZ5xyxcFrun4tEUvXaBES2RFRMwp0i']  # El ID de tu carpeta
         }
         
         media = MediaFileUpload(html_filename, mimetype='text/html', resumable=True)
