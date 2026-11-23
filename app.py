@@ -415,8 +415,10 @@ def ejecutar_optimizacion():
         except Exception as perm_e:
             print(f"Advertencia al dar permisos de dominio: {perm_e}")
 
-        formula_link = f'=HYPERLINK("{direct_download_url}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
-        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')        # =========================================================
+        enlace_vista = f'https://drive.google.com/file/d/{file_id}/view'
+
+        formula_link = f'=HYPERLINK("{enlace_vista}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
+        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')       # =========================================================
         # 9. ACTUALIZAR HOJA "portfolio"
         # =========================================================
         try:
