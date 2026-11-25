@@ -206,7 +206,7 @@ def ejecutar_optimizacion():
             roots_clean = {str(k).strip(): str(v).strip() for k, v in roots.items()}
 
             # Siempre inicia en 0.20; solo escala si resulta inviable (None = sin límite duro)
-            tolerancias = [0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.99, 1.50, 2.00, None]
+            tolerancias = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.99, 1.50, 2.00, None]
 
             for tol_actual in tolerancias:
                 prob = pulp.LpProblem("Balanceo", pulp.LpMinimize)
