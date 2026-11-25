@@ -438,8 +438,9 @@ def ejecutar_optimizacion():
         except Exception as perm_e:
             print(f"Advertencia al dar permisos de dominio: {perm_e}")
 
-        enlace_vista = f'https://drive.google.com/file/d/{file_id}/view'
-        formula_link = f'=HYPERLINK("{enlace_vista}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
+        # Forzar descarga directa usando la sesión corporativa de didi-labs.com
+        enlace_descarga = f'https://drive.google.com/a/didi-labs.com/uc?export=download&id={file_id}'
+        formula_link = f'=HYPERLINK("{enlace_descarga}", "🗺️ Descargar Mapa {ciudad_seleccionada}, {escenario}")'
 
         sheet_summary.batch_clear(['H7'])
         sheet_summary.update_acell('H7', formula_link)
