@@ -1,10 +1,13 @@
 from flask import Flask, request, jsonify
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 import pandas as pd
 import geopandas as gpd
+import folium
+import matplotlib.colors as mcolors
 import traceback
 import io
 import re
@@ -55,7 +58,7 @@ def ejecutar_optimizacion():
             
         df = pd.DataFrame(df_crudo.values[fila_encabezados+1:], columns=df_crudo.iloc[fila_encabezados])
         df.columns = df.columns.str.strip()
-        df = df[df['BD Area ID'].str.strip() != '']
+        df = df[df['BD Area ID'].str.strip() != ''].reset_index(drop=True)
         
         df['BD Area ID'] = df['BD Area ID'].astype(str).str.strip()
         df['Rs 1'] = pd.to_numeric(df['Rs 1'], errors='coerce').fillna(0)
@@ -78,6 +81,8 @@ def ejecutar_optimizacion():
                 bd_baja = bd_implicado.strip()
             else:
                 bds_elegibles = bds_actuales
+        else:
+            bds_elegibles = bds_actuales
         
         TARGET = total_shops / len(bds_elegibles) if len(bds_elegibles) > 0 else 0
 
@@ -183,10 +188,12 @@ def ejecutar_optimizacion():
                         roots[bd_sobrado] = areas_sobrado.iloc[1]['BD Area ID']
 
         # =========================================================
-        # 6. MOTOR MATEMÁTICO (FUNCIÓN SOLVE)
+        # 6. MOTOR MATEMÁTICO (TOLERANCIA ESCALONADA Y PROPUESTAS DISTINTAS)
         # =========================================================
-        def solve_scenario(w1, w2, nombre_escenario=""):
-            prob = pulp.LpProblem("Balanceo", pulp.LpMinimize)
+        def solve_scenario(w1, w2, nombre_escenario="", soluciones_previas=None):
+            if soluciones_previas is None:
+                soluciones_previas = []
+
             nodos = [str(a).strip() for a in df['BD Area ID'].unique()]
             equipos = [str(b).strip() for b in bds_elegibles]
             pares_limpios = [(str(i).strip(), str(j).strip()) for i, j in neighbor_pairs]
@@ -198,105 +205,131 @@ def ejecutar_optimizacion():
 
             roots_clean = {str(k).strip(): str(v).strip() for k, v in roots.items()}
 
-            x_keys = [(a, b) for a in nodos for b in equipos]
-            x = pulp.LpVariable.dicts("x", x_keys, cat='Binary')
-            dev = pulp.LpVariable.dicts("dev", equipos, lowBound=0)
-            move = pulp.LpVariable.dicts("move", x_keys, cat='Binary')
+            # Siempre inicia en 0.20; solo escala si resulta inviable (None = sin límite duro)
+            tolerancias = [0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.99, 1.50, 2.00, None]
 
-            for a in nodos:
-                prob += pulp.lpSum(x[(a, b)] for b in equipos) == 1
+            for tol_actual in tolerancias:
+                prob = pulp.LpProblem("Balanceo", pulp.LpMinimize)
 
-            TOL = 0.99 if escenario == 'Distribution with current HC' else 0.20
-            LOW = TARGET * (1 - TOL)  
-            HIGH = TARGET * (1 + TOL) 
+                x_keys = [(a, b) for a in nodos for b in equipos]
+                x = pulp.LpVariable.dicts("x", x_keys, cat='Binary')
+                dev = pulp.LpVariable.dicts("dev", equipos, lowBound=0)
+                move = pulp.LpVariable.dicts("move", x_keys, cat='Binary')
 
-            for b in equipos:
-                total_b = pulp.lpSum(
-                    df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'Rs 1'].iat[0] * x[(a, b)] 
-                    for a in nodos
-                )
-                prob += total_b >= LOW   
-                prob += total_b <= HIGH  
-                prob += dev[b] >= total_b - TARGET
-                prob += dev[b] >= TARGET - total_b
+                # 1. Asignación única
+                for a in nodos:
+                    prob += pulp.lpSum(x[(a, b)] for b in equipos) == 1
 
-            for a in nodos:
-                bd_actual_raw = df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'BD Actual'].iat[0]
-                bd_actual_a = str(bd_actual_raw).strip()
+                # 2. Restricción de varianza dinámica
                 for b in equipos:
-                    if escenario == 'Termination' and bd_baja and bd_actual_a == str(bd_baja).strip():
-                        prob += move[(a, b)] == 0
+                    total_b = pulp.lpSum(
+                        df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'Rs 1'].iat[0] * x[(a, b)] 
+                        for a in nodos
+                    )
+                    if tol_actual is not None:
+                        LOW = max(0, TARGET * (1 - tol_actual))
+                        HIGH = TARGET * (1 + tol_actual)
+                        prob += total_b >= LOW
+                        prob += total_b <= HIGH
+
+                    prob += dev[b] >= total_b - TARGET
+                    prob += dev[b] >= TARGET - total_b
+
+                # 3. Restricción de movimientos
+                for a in nodos:
+                    bd_actual_raw = df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'BD Actual'].iat[0]
+                    bd_actual_a = str(bd_actual_raw).strip()
+                    for b in equipos:
+                        if escenario == 'Termination' and bd_baja and bd_actual_a == str(bd_baja).strip():
+                            prob += move[(a, b)] == 0
+                        else:
+                            es_orig = 1 if bd_actual_a == b else 0
+                            prob += move[(a, b)] >= x[(a, b)] - es_orig
+                            prob += move[(a, b)] >= es_orig - x[(a, b)]
+
+                # 4. Contigüidad (Flujo de Redes)
+                max_flow = len(nodos)
+                f_vars = [(i, j, b) for i, j in pares_limpios for b in equipos] + \
+                         [(j, i, b) for i, j in pares_limpios for b in equipos]
+                f = pulp.LpVariable.dicts("f", f_vars, lowBound=0, upBound=max_flow)
+
+                for i, j in pares_limpios:
+                    for b in equipos:
+                        prob += f[(i, j, b)] <= max_flow * x[(i, b)]
+                        prob += f[(i, j, b)] <= max_flow * x[(j, b)]
+                        prob += f[(j, i, b)] <= max_flow * x[(j, b)]
+                        prob += f[(j, i, b)] <= max_flow * x[(i, b)]
+
+                for b in equipos:
+                    if b in roots_clean:
+                        r = roots_clean[b]
+                        prob += x[(r, b)] == 1 
+                        prob += (pulp.lpSum(f[(r, j, b)] for j in dict_vecinos[r]) -
+                                 pulp.lpSum(f[(j, r, b)] for j in dict_vecinos[r])) == pulp.lpSum(x[(a, b)] for a in nodos) - 1
+                        for a in nodos:
+                            if a != r:
+                                prob += (pulp.lpSum(f[(i, a, b)] for i in dict_vecinos[a]) -
+                                         pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) == x[(a, b)]
                     else:
-                        es_orig = 1 if bd_actual_a == b else 0
-                        prob += move[(a, b)] >= x[(a, b)] - es_orig
-                        prob += move[(a, b)] >= es_orig - x[(a, b)]
-
-            max_flow = len(nodos)
-            f_vars = [(i, j, b) for i, j in pares_limpios for b in equipos] + \
-                     [(j, i, b) for i, j in pares_limpios for b in equipos]
-            f = pulp.LpVariable.dicts("f", f_vars, lowBound=0, upBound=max_flow)
-
-            for i, j in pares_limpios:
-                for b in equipos:
-                    prob += f[(i, j, b)] <= max_flow * x[(i, b)]
-                    prob += f[(i, j, b)] <= max_flow * x[(j, b)]
-                    prob += f[(j, i, b)] <= max_flow * x[(j, b)]
-                    prob += f[(j, i, b)] <= max_flow * x[(i, b)]
-
-            for b in equipos:
-                if b in roots_clean:
-                    r = roots_clean[b]
-                    prob += x[(r, b)] == 1 
-                    prob += (pulp.lpSum(f[(r, j, b)] for j in dict_vecinos[r]) -
-                             pulp.lpSum(f[(j, r, b)] for j in dict_vecinos[r])) == pulp.lpSum(x[(a, b)] for a in nodos) - 1
-                    for a in nodos:
-                        if a != r:
+                        sink_vars = pulp.LpVariable.dicts(f"sink_{b}", nodos, cat='Binary')
+                        prob += pulp.lpSum(sink_vars[a] for a in nodos) == 1
+                        for a in nodos:
+                            prob += sink_vars[a] <= x[(a, b)]
                             prob += (pulp.lpSum(f[(i, a, b)] for i in dict_vecinos[a]) -
-                                     pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) == x[(a, b)]
-                else:
-                    sink_vars = pulp.LpVariable.dicts(f"sink_{b}", nodos, cat='Binary')
-                    prob += pulp.lpSum(sink_vars[a] for a in nodos) == 1
+                                     pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) >= x[(a, b)] - max_flow * sink_vars[a]
+                            prob += (pulp.lpSum(f[(i, a, b)] for i in dict_vecinos[a]) -
+                                     pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) <= x[(a, b)] + max_flow * sink_vars[a]
+
+                # 5. Exclusión de soluciones previas (evita propuestas idénticas)
+                for sol_prev in soluciones_previas:
+                    prob += pulp.lpSum(x[(a, b)] for (a, b) in sol_prev) <= len(nodos) - 1
+
+                # 6. Función objetivo
+                dev_shops_sum = pulp.lpSum(dev[b] for b in equipos)
+                move_cost_sum = pulp.lpSum(move[(a, b)] for a in nodos for b in equipos)
+                prob += w1 * dev_shops_sum + w2 * move_cost_sum
+
+                solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=180)
+                prob.solve(solver)
+
+                if pulp.LpStatus[prob.status] == "Optimal":
+                    sol = []
+                    asignacion_actual = []
                     for a in nodos:
-                        prob += sink_vars[a] <= x[(a, b)]
-                        prob += (pulp.lpSum(f[(i, a, b)] for i in dict_vecinos[a]) -
-                                 pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) >= x[(a, b)] - max_flow * sink_vars[a]
-                        prob += (pulp.lpSum(f[(i, a, b)] for i in dict_vecinos[a]) -
-                                 pulp.lpSum(f[(a, j, b)] for j in dict_vecinos[a])) <= x[(a, b)] + max_flow * sink_vars[a]
+                        for b in equipos:
+                            if x[(a, b)].value() is not None and x[(a, b)].value() > 0.5:
+                                id_orig = df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'BD Area ID'].iat[0]
+                                sol.append({'BD Area ID': id_orig, nombre_escenario: b})
+                                asignacion_actual.append((a, b))
+                    print(f"✅ {nombre_escenario} resuelta con TOL={tol_actual}")
+                    return pd.DataFrame(sol), asignacion_actual
 
-            dev_shops_sum = pulp.lpSum(dev[b] for b in equipos)
-            move_cost_sum = pulp.lpSum(move[(a, b)] for a in nodos for b in equipos)
-            prob += w1 * dev_shops_sum + w2 * move_cost_sum
-
-            solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=180)
-            prob.solve(solver)
-            
-            if pulp.LpStatus[prob.status] != "Optimal":
-                return None
-
-            sol = []
-            for a in nodos:
-                for b in equipos:
-                    if x[(a, b)].value() is not None and x[(a, b)].value() > 0.5:
-                        id_orig = df.loc[df['BD Area ID'].astype(str).str.strip() == a, 'BD Area ID'].iat[0]
-                        sol.append({'BD Area ID': id_orig, nombre_escenario: b})
-            return pd.DataFrame(sol)
+            return None, []
 
         # =========================================================
         # 7. EJECUCIÓN Y EXPORTACIÓN A GOOGLE SHEETS (SUMMARY)
         # =========================================================
-        df_p1 = solve_scenario(1.0, 0.0, "Propuesta 1")
-        df_p2 = solve_scenario(0.5, 0.5, "Propuesta 2")
-        df_p3 = solve_scenario(0.1, 0.9, "Propuesta 3")
+        soluciones_previas = []
+
+        df_p1, asig_p1 = solve_scenario(1.0, 0.0, "Propuesta 1", soluciones_previas)
+        if asig_p1:
+            soluciones_previas.append(asig_p1)
+
+        df_p2, asig_p2 = solve_scenario(0.5, 0.5, "Propuesta 2", soluciones_previas)
+        if asig_p2:
+            soluciones_previas.append(asig_p2)
+
+        df_p3, asig_p3 = solve_scenario(0.1, 0.9, "Propuesta 3", soluciones_previas)
 
         df_export = df[['BD Area ID']].copy()
-        df_export = df_export.merge(df_p1, on='BD Area ID', how='left') if df_p1 is not None else df_export.assign(**{'Propuesta 1': "Inviable"})
-        df_export = df_export.merge(df_p2, on='BD Area ID', how='left') if df_p2 is not None else df_export.assign(**{'Propuesta 2': "Inviable"})
-        df_export = df_export.merge(df_p3, on='BD Area ID', how='left') if df_p3 is not None else df_export.assign(**{'Propuesta 3': "Inviable"})
+        df_export = df_export.merge(df_p1, on='BD Area ID', how='left') if df_p1 is not None else df_export.assign(**{'Propuesta 1': "Sin Asignar"})
+        df_export = df_export.merge(df_p2, on='BD Area ID', how='left') if df_p2 is not None else df_export.assign(**{'Propuesta 2': "Sin Asignar"})
+        df_export = df_export.merge(df_p3, on='BD Area ID', how='left') if df_p3 is not None else df_export.assign(**{'Propuesta 3': "Sin Asignar"})
 
-        # Asegúrate de reincorporar las columnas de propuestas al df principal para que el mapa las lea
-        df['Propuesta 1'] = df_export['Propuesta 1']
-        df['Propuesta 2'] = df_export['Propuesta 2']
-        df['Propuesta 3'] = df_export['Propuesta 3']
+        # Reincorporar propuestas alineadas correctamente al df principal
+        df['Propuesta 1'] = df_export['Propuesta 1'].values
+        df['Propuesta 2'] = df_export['Propuesta 2'].values
+        df['Propuesta 3'] = df_export['Propuesta 3'].values
 
         fila_inicio_datos = fila_encabezados + 2
         rango_limpiar = f'J{fila_inicio_datos}:L'
@@ -308,11 +341,6 @@ def ejecutar_optimizacion():
         # =========================================================
         # 8. GENERAR MAPA Y SUBIR A DRIVE
         # =========================================================
-        import folium
-        from googleapiclient.http import MediaFileUpload
-        import matplotlib.colors as mcolors
-
-        # Sistema automático de cruce para el mapa (Fallback)
         gdf_final = gdf_kml.merge(df, left_on='KML_ID', right_on='Sheets_ID', how='inner')
         if len(gdf_final) == 0:
             gdf_final = gdf_kml.merge(df, left_on='KML_Name_Num', right_on='Sheets_Name_Num', how='inner')
@@ -324,11 +352,9 @@ def ejecutar_optimizacion():
         color_dict = {bd: colores_base[i % len(colores_base)] for i, bd in enumerate(bds_todos)}
         color_dict['Sin Asignar'] = '#000000'
 
-        # Calcular centro limpiamente
         centro_y = gdf_final.geometry.centroid.y.mean() if not gdf_final.empty else 0
         centro_x = gdf_final.geometry.centroid.x.mean() if not gdf_final.empty else 0
 
-        # Usar un enlace de mapa directo para evadir baneos de OSM y marcas de agua de CartoDB
         tiles_url = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
         attr = '&copy; OpenStreetMap contributors &copy; CARTO'
         m = folium.Map(location=[centro_y, centro_x], zoom_start=12, tiles=tiles_url, attr=attr)
@@ -367,7 +393,6 @@ def ejecutar_optimizacion():
         fg_p3.add_to(m)
         folium.LayerControl().add_to(m)
 
-        # LEYENDA
         legend_html = '''
         <div style="position: fixed;
                     top: 150px; right: 10px; width: auto; max-height: 400px; overflow-y: auto;
@@ -382,7 +407,6 @@ def ejecutar_optimizacion():
 
         m.get_root().html.add_child(folium.Element(legend_html))
 
-        # Guardar y subir a Drive
         ciudad_seleccionada = sheet_summary.acell('C5').value
         if not ciudad_seleccionada:
             ciudad_seleccionada = "General"
@@ -404,7 +428,6 @@ def ejecutar_optimizacion():
         ).execute()
 
         file_id = uploaded_file.get('id')
-        direct_download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
 
         try:
             drive_service.permissions().create(
@@ -416,10 +439,13 @@ def ejecutar_optimizacion():
             print(f"Advertencia al dar permisos de dominio: {perm_e}")
 
         enlace_vista = f'https://drive.google.com/file/d/{file_id}/view'
-
         formula_link = f'=HYPERLINK("{enlace_vista}", "🗺️ Abrir Mapa {ciudad_seleccionada}, {escenario}")'
-        sheet_summary.update(values=[[formula_link]], range_name='H7', value_input_option='USER_ENTERED')       # =========================================================
-        # 9. ACTUALIZAR HOJA "portfolio"
+
+        sheet_summary.batch_clear(['H7'])
+        sheet_summary.update_acell('H7', formula_link)
+
+        # =========================================================
+        # 9. ACTUALIZAR HOJA "portfolio" (LIMPIANDO COLUMNAS Z, AA, AB)
         # =========================================================
         try:
             sheet_portfolio = spreadsheet.worksheet('portfolio')
@@ -427,6 +453,14 @@ def ejecutar_optimizacion():
             encabezados_port = portfolio_raw[0]
 
             df_port = pd.DataFrame(portfolio_raw[1:], columns=encabezados_port)
+
+            # Limpiar columnas Z, AA, AB en la hoja antes de imprimir nuevos resultados
+            sheet_portfolio.batch_clear(['Z2:AB'])
+
+            # Vaciar las columnas en el DataFrame para no arrastrar asignaciones anteriores
+            df_port['Propuesta 1'] = ''
+            df_port['Propuesta 2'] = ''
+            df_port['Propuesta 3'] = ''
 
             map_p1 = {re.sub(r'[^0-9]', '', str(k)): v for k, v in zip(df['BD Area ID'], df['Propuesta 1'])}
             map_p2 = {re.sub(r'[^0-9]', '', str(k)): v for k, v in zip(df['BD Area ID'], df['Propuesta 2'])}
@@ -442,20 +476,18 @@ def ejecutar_optimizacion():
 
             col_inicio_idx = encabezados_port.index('Propuesta 1') + 1
             columnas_subir_port = ['Propuesta 1', 'Propuesta 2', 'Propuesta 3']
-            datos_subir_port = df_port[columnas_subir_port].values.tolist()
+            datos_subir_port = df_port[columnas_subir_port].fillna('').values.tolist()
 
-            from gspread.utils import rowcol_to_a1
             rango_inicio_port = rowcol_to_a1(2, col_inicio_idx)
             rango_fin_port = rowcol_to_a1(1 + len(datos_subir_port), col_inicio_idx + 2)
             
-            sheet_portfolio.update(values=datos_subir_port, range_name=f'{rango_inicio_port}:{rango_fin_port}')
+            sheet_portfolio.update(f'{rango_inicio_port}:{rango_fin_port}', datos_subir_port)
         except Exception as port_e:
             print(f"Error actualizando la hoja portfolio: {port_e}")
 
         return jsonify({"mensaje": "Balanceo exitoso y Sheets actualizado"}), 200
         
     except Exception as e:
-        import traceback
         error_detallado = traceback.format_exc()
         print("ERROR FATAL:\n", error_detallado)
         return jsonify({"error": error_detallado}), 500
